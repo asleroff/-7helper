@@ -64,8 +64,11 @@ async def _backfill_leftover(db):
 async def add_user(user_id: int, username: str = None, full_name: str = None, is_admin: bool = False):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            """INSERT OR IGNORE INTO users (user_id, username, full_name, is_admin, created_at)
-               VALUES (?, ?, ?, ?, ?)""",
+            """INSERT INTO users (user_id, username, full_name, is_admin, created_at)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(user_id) DO UPDATE SET
+                 username=excluded.username,
+                 full_name=excluded.full_name""",
             (user_id, username, full_name, int(is_admin), datetime.now().isoformat())
         )
         await db.commit()

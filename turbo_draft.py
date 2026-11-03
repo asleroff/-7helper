@@ -85,7 +85,6 @@ def closing_fields_from_draft(payload: dict[str, Any]) -> dict[str, Any]:
         "closing_shortage": num("shortage"),
         "closing_excess": num("excess"),
         "closing_zasyl": num("zasyl"),
-        "closing_nedovoz": num("nedovoz"),  # из Турбо обычно None
         "closing_issued": num("issued"),
         "closing_leftover": num("leftover"),
         "turbo_collected_at": draft.get("collected_at") or payload.get("saved_at"),
@@ -94,7 +93,7 @@ def closing_fields_from_draft(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def missing_closing_fields(fields: dict[str, Any]) -> list[str]:
-    """Обязательные поля кроме недовоз (его дописывают руками)."""
+    """Обязательные поля закрытия из черновика Турбо."""
     required = [
         ("closing_transport_number", "номер перевозки"),
         ("closing_transport_date", "дата перевозки"),

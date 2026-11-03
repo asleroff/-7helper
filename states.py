@@ -17,11 +17,11 @@ class ReportStates(StatesGroup):
     closing_shortage = State()
     closing_excess = State()
     closing_zasyl = State()
-    closing_nedovoz = State()
     closing_issued = State()
     closing_leftover = State()
     waiting_one_message = State()
-    turbo_review = State()
+    choosing_edit_field = State()
+    editing_field_value = State()
     confirming = State()
 
 class StatsStates(StatesGroup):

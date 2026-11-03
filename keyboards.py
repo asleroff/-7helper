@@ -29,22 +29,19 @@ def fill_method_kb(report_type: str | None = None):
     builder.adjust(1)
     return builder.as_markup()
 
+def edit_fields_kb(rows: list[tuple[str, str]]):
+    builder = InlineKeyboardBuilder()
+    for callback_data, title in rows:
+        builder.button(text=title, callback_data=callback_data)
+    builder.button(text="◀️ К превью", callback_data="edit_done")
+    builder.adjust(1)
+    return builder.as_markup()
+
 def confirm_kb():
     builder = InlineKeyboardBuilder()
     builder.button(text="✅ Отправить в чат", callback_data="confirm_send")
     builder.button(text="✏️ Изменить", callback_data="edit_report")
     builder.button(text="◀️ Назад", callback_data="step_back:confirm")
-    builder.button(text="❌ Отмена", callback_data="cancel")
-    builder.adjust(1)
-    return builder.as_markup()
-
-def turbo_preview_kb():
-    """Превью черновика из Турбо до дописывания недовоз / отправки."""
-    builder = InlineKeyboardBuilder()
-    builder.button(text="📭 Указать недовоз и дальше", callback_data="turbo:nedovoz")
-    builder.button(text="✅ К подтверждению (недовоз = 0)", callback_data="turbo:preview_zero_nedovoz")
-    builder.button(text="✏️ Править текст", callback_data="edit_report")
-    builder.button(text="◀️ Назад", callback_data="step_back:method")
     builder.button(text="❌ Отмена", callback_data="cancel")
     builder.adjust(1)
     return builder.as_markup()

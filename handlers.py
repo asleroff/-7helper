@@ -1,4 +1,4 @@
-from aiogram import Router, F, Bot
+from aiogram import BaseMiddleware, Router, F, Bot
 from aiogram.enums import ChatType
 from aiogram.types import Message, CallbackQuery, LinkPreviewOptions
 from aiogram.filters import Command, CommandStart
@@ -18,6 +18,20 @@ import turbo_draft
 router = Router()
 router.message.filter(F.chat.type == ChatType.PRIVATE)
 router.callback_query.filter(F.message.chat.type == ChatType.PRIVATE)
+
+
+class RememberUserMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        user = getattr(event, "from_user", None)
+        if user is not None:
+            try:
+                await db.add_user(user.id, user.username, user.full_name)
+            except Exception:
+                pass
+        return await handler(event, data)
+
+
+router.message.middleware(RememberUserMiddleware())
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
@@ -133,6 +147,9 @@ async def start_report(message: Message, state: FSMContext):
 
 @router.message(ReportStates.waiting_point_number)
 async def process_point_number(message: Message, state: FSMContext):
+    if not message.text or not message.text.strip():
+        await message.answer("✏️ Напиши номер ПП цифрами, например 1125.")
+        return
     point_number = re.sub(r'\D', '', message.text.strip())
     if not point_number:
         await message.answer("✏️ Напиши номер ПП цифрами, например 1125.")
@@ -153,14 +170,65 @@ async def process_report_type(callback: CallbackQuery, state: FSMContext):
     await state.update_data(report_type=report_type)
     await ask_step("method", state, callback=callback)
 
+CLOSING_EDIT_FIELDS = (
+    ("closing_transport_number", "Номер перевозки", "text"),
+    ("closing_transport_date", "Дата", "text"),
+    ("closing_time", "Время", "text"),
+    ("closing_accepted_total", "Принято", "number"),
+    ("closing_tya", "ТЯ", "number"),
+    ("closing_ktya", "КТЯ", "number"),
+    ("closing_shortage", "Недостачи", "number"),
+    ("closing_excess", "Излишки", "number"),
+    ("closing_zasyl", "Засылы", "number"),
+    ("closing_issued", "Выдано", "number"),
+    ("closing_leftover", "Остатки", "number"),
+)
+CLOSING_EDIT_BY_KEY = {key: (label, kind) for key, label, kind in CLOSING_EDIT_FIELDS}
+
+
+def closing_edit_rows(data: dict) -> list[tuple[str, str]]:
+    rows = []
+    for key, label, _kind in CLOSING_EDIT_FIELDS:
+        value = data.get(key)
+        shown = "—" if value is None or value == "" else value
+        rows.append((f"edit_field:{key}", f"{label}: {shown}"))
+    return rows
+
+
+async def refresh_closing_preview(state: FSMContext, user, bot: Bot) -> str:
+    data = await state.get_data()
+    report_text = await sign_report(build_report(data), user, bot)
+    await state.update_data(
+        report_text=report_text,
+        accepted=data.get("closing_accepted_total"),
+        issued=data.get("closing_issued"),
+        leftover=data.get("closing_leftover"),
+        editing_key=None,
+    )
+    return report_text
+
+
+async def show_edit_menu(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    await state.set_state(ReportStates.choosing_edit_field)
+    await callback.message.edit_text(
+        "✏️ Что поменять? Нажми поле и пришли только новое значение.",
+        reply_markup=edit_fields_kb(closing_edit_rows(data)),
+    )
+
+
 @router.callback_query(F.data.startswith("step_back:"))
 @router.callback_query(F.data == "back_to_types")
 async def on_step_back(callback: CallbackQuery, state: FSMContext):
     target = "types" if callback.data == "back_to_types" else callback.data.split(":", 1)[1]
+    if target == "edit_menu":
+        await show_edit_menu(callback, state)
+        await callback.answer()
+        return
     if target == "confirm":
         data = await state.get_data()
         if data.get("fill_method") == "turbo":
-            target = "turbo"
+            target = "method"
         elif data.get("fill_method") == "steps" and data.get("report_type") == "opening":
             target = "opening_names"
         elif data.get("fill_method") == "steps" and data.get("report_type") == "machine":
@@ -250,8 +318,6 @@ async def start_turbo(callback: CallbackQuery, state: FSMContext):
     for key, value in fields.items():
         if key.startswith("closing_") and value is not None:
             update[key] = value
-    # Недовоз из Турбо обычно пустой — спросим отдельно
-    update.pop("closing_nedovoz", None)
     await state.update_data(**update)
 
     if missing:
@@ -264,7 +330,19 @@ async def start_turbo(callback: CallbackQuery, state: FSMContext):
         await state.set_state(ReportStates.choosing_fill_method)
         return
 
-    await ask_step("turbo", state, callback=callback, edit=True)
+    data = await state.get_data()
+    report_text = await sign_report(build_report(data), callback.from_user, callback.bot)
+    await state.update_data(
+        report_text=report_text,
+        accepted=data.get("closing_accepted_total"),
+        issued=data.get("closing_issued"),
+        leftover=data.get("closing_leftover"),
+    )
+    await state.set_state(ReportStates.confirming)
+    await callback.message.edit_text(
+        f"👀 Вот так уйдёт в чат:\n\n{escape(report_text)}\n\nОтправляем?",
+        reply_markup=confirm_kb(),
+    )
 
 async def take_text(message: Message) -> str | None:
     if not message.text or not message.text.strip():
@@ -291,23 +369,6 @@ def step_view(target: str, data: dict) -> tuple:
             ReportStates.confirming,
             f"👀 Вот так уйдёт в чат:\n\n{report_text}\n\nОтправляем?",
             confirm_kb(),
-        )
-    if target == "turbo":
-        preview_data = dict(data)
-        preview_data["closing_nedovoz"] = data.get("closing_nedovoz")
-        if preview_data.get("closing_nedovoz") is None:
-            preview_data["closing_nedovoz"] = "(укажи вручную)"
-        collected = data.get("turbo_collected_at") or "—"
-        body = escape(build_report(preview_data))
-        return (
-            ReportStates.turbo_review,
-            (
-                f"⚡ Черновик из Турбо для ПП_{escape(str(point))}\n"
-                f"Собран: {escape(str(collected))}\n\n"
-                f"{body}\n\n"
-                "Недовоз в Турбо нет — укажи число или поставь 0."
-            ),
-            turbo_preview_kb(),
         )
     views = {
         "point": (ReportStates.waiting_point_number, "📋 Напиши номер ПП, например 1125", step_kb()),
@@ -341,8 +402,7 @@ def step_view(target: str, data: dict) -> tuple:
         "shortage": (ReportStates.closing_shortage, "⚠️ Недостачи. Напиши число:", step_kb("ktya")),
         "excess": (ReportStates.closing_excess, "➕ Излишки. Напиши число:", step_kb("shortage")),
         "zasyl": (ReportStates.closing_zasyl, "↪️ Засылы. Напиши число:", step_kb("excess")),
-        "nedovoz": (ReportStates.closing_nedovoz, "📭 Недовоз. Напиши число:", step_kb("zasyl")),
-        "issued": (ReportStates.closing_issued, "📤 Выдано. Напиши число:", step_kb("nedovoz")),
+        "issued": (ReportStates.closing_issued, "📤 Выдано. Напиши число:", step_kb("zasyl")),
         "leftover": (ReportStates.closing_leftover, "🏬 Остатки на складе. Напиши число:", step_kb("issued")),
         "place_pp": (AdminStates.waiting_place_pp, "🏷 Номер ПП, например 1125 или ПП_1125:", step_kb()),
         "place_ozon": (
@@ -370,6 +430,7 @@ async def ask_step(
     message: Message | None = None,
     callback: CallbackQuery | None = None,
     edit: bool = True,
+    answer_callback: bool = True,
 ):
     data = await state.get_data()
     new_state, text, markup = step_view(target, data)
@@ -379,9 +440,34 @@ async def ask_step(
             await callback.message.edit_text(text, reply_markup=markup)
         else:
             await callback.message.answer(text, reply_markup=markup)
-        await callback.answer()
+        if answer_callback:
+            await callback.answer()
         return
     await message.answer(text, reply_markup=markup)
+
+def report_signature(user, bot_username: str) -> str:
+    if user is not None and user.username:
+        who = f"@{user.username}"
+    elif user is not None and user.full_name:
+        who = user.full_name
+    else:
+        who = "без username"
+    bot_name = bot_username or "plus7helper_bot"
+    return f"Отчет от: {who}\nС помощью @{bot_name}"
+
+
+def strip_report_signature(text: str) -> str:
+    lines = text.rstrip().split("\n")
+    if len(lines) >= 2 and lines[-1].startswith("С помощью @") and lines[-2].startswith("Отчет от:"):
+        return "\n".join(lines[:-2]).rstrip()
+    return text.rstrip()
+
+
+async def sign_report(text: str, user, bot: Bot) -> str:
+    me = await bot.me()
+    body = strip_report_signature(text)
+    return f"{body}\n{report_signature(user, me.username)}"
+
 
 def build_report(data: dict) -> str:
     header = f"ПП_{data.get('point_number', '')}"
@@ -404,20 +490,26 @@ def build_report(data: dict) -> str:
         shipment = str(data["closing_transport_number"]).lstrip("#").strip()
         lines = [
             f"ПП-{data.get('point_number', '')}",
+            "",
             f"Закрыли перевозку #{shipment} от {data['closing_transport_date']}.",
+            "",
             f"Закрыли перевозку в {data['closing_time']}",
+            "",
             f"Принято всего: {data['closing_accepted_total']} ед.",
-            f"ТЯ: {data['closing_tya']}",
-            f"КТЯ: {data['closing_ktya']}",
-            f"Недостачи: {data['closing_shortage']}",
-            f"Излишки: {data['closing_excess']}",
-            f"Засылы: {data['closing_zasyl']}",
-            f"Недовоз: {data['closing_nedovoz']}",
+            "",
+            f"1) ТЯ: {data['closing_tya']}",
+            f"2) КТЯ: {data['closing_ktya']}",
+            f"3) Недостачи: {data['closing_shortage']}",
+            f"4) Излишки: {data['closing_excess']}",
+            f"5) Засылы: {data['closing_zasyl']}",
+            "",
             f"Выдано: {data['closing_issued']} ед.",
+            "",
             f"Остатки на складе: {data['closing_leftover']} ед.",
+            "",
             "ПП - закрыто.",
         ]
-        return "\n\n".join(lines)
+        return "\n".join(lines)
     return "\n".join(lines)
 
 async def show_preview(
@@ -428,6 +520,7 @@ async def show_preview(
     issued: int | None,
     leftover: int | None = None,
 ):
+    report_text = await sign_report(report_text, message.from_user, message.bot)
     await state.update_data(report_text=report_text, accepted=accepted, issued=issued, leftover=leftover)
     await state.set_state(ReportStates.confirming)
     await message.answer(
@@ -529,59 +622,7 @@ async def process_closing_zasyl(message: Message, state: FSMContext):
     if value is None:
         return
     await state.update_data(closing_zasyl=value)
-    await ask_step("nedovoz", state, message=message)
-
-@router.message(ReportStates.closing_nedovoz)
-async def process_closing_nedovoz(message: Message, state: FSMContext):
-    value = await take_number(message)
-    if value is None:
-        return
-    await state.update_data(closing_nedovoz=value)
-    data = await state.get_data()
-    if data.get("fill_method") == "turbo":
-        await show_preview(
-            message,
-            state,
-            build_report(data),
-            data.get("closing_accepted_total"),
-            data.get("closing_issued"),
-            data.get("closing_leftover"),
-        )
-        return
     await ask_step("issued", state, message=message)
-
-@router.callback_query(ReportStates.turbo_review, F.data == "turbo:nedovoz")
-async def turbo_ask_nedovoz(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(ReportStates.closing_nedovoz)
-    await callback.message.edit_text(
-        "📭 Сколько недовоз? Напиши число (можно 0):",
-        reply_markup=step_kb("turbo"),
-    )
-    await callback.answer()
-
-@router.callback_query(ReportStates.turbo_review, F.data == "turbo:preview_zero_nedovoz")
-async def turbo_zero_nedovoz(callback: CallbackQuery, state: FSMContext):
-    await state.update_data(closing_nedovoz=0)
-    data = await state.get_data()
-    await callback.message.edit_text("📭 Недовоз: 0")
-    await show_preview(
-        callback.message,
-        state,
-        build_report(data),
-        data.get("closing_accepted_total"),
-        data.get("closing_issued"),
-        data.get("closing_leftover"),
-    )
-    await callback.answer()
-
-@router.callback_query(ReportStates.turbo_review, F.data == "edit_report")
-async def edit_turbo_report(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(ReportStates.waiting_one_message)
-    await callback.message.edit_text(
-        "✏️ Пришли текст заново, одним сообщением:",
-        reply_markup=step_kb("turbo"),
-    )
-    await callback.answer()
 
 @router.message(ReportStates.closing_issued)
 async def process_closing_issued(message: Message, state: FSMContext):
@@ -645,10 +686,101 @@ async def process_one_message(message: Message, state: FSMContext):
 
 @router.callback_query(ReportStates.confirming, F.data == "edit_report")
 async def edit_report(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if data.get("report_type") == "closing" and data.get("closing_transport_number") is not None:
+        await show_edit_menu(callback, state)
+        await callback.answer()
+        return
     await state.set_state(ReportStates.waiting_one_message)
     await callback.message.edit_text(
         "✏️ Пришли текст заново, одним сообщением:",
         reply_markup=step_kb("preview"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(ReportStates.choosing_edit_field, F.data.startswith("edit_field:"))
+async def choose_edit_field(callback: CallbackQuery, state: FSMContext):
+    key = callback.data.split(":", 1)[1]
+    spec = CLOSING_EDIT_BY_KEY.get(key)
+    if spec is None:
+        await callback.answer("Такого поля нет.", show_alert=True)
+        return
+    label, kind = spec
+    data = await state.get_data()
+    current = data.get(key)
+    shown = "—" if current is None or current == "" else current
+    await state.update_data(editing_key=key)
+    await state.set_state(ReportStates.editing_field_value)
+    hint = "Пришли число, можно 0." if kind == "number" else "Пришли новое значение."
+    markup = step_kb("edit_menu", now="edit_time_now") if key == "closing_time" else step_kb("edit_menu")
+    await callback.message.edit_text(
+        f"✏️ {label}\nСейчас: {escape(str(shown))}\n\n{hint}",
+        reply_markup=markup,
+    )
+    await callback.answer()
+
+
+async def store_edited_field(message: Message, state: FSMContext, value):
+    data = await state.get_data()
+    key = data.get("editing_key")
+    spec = CLOSING_EDIT_BY_KEY.get(key or "")
+    if spec is None:
+        await message.answer("⚠️ Не вижу, какое поле менять. Нажми «✏️ Изменить» ещё раз.")
+        return
+    if key == "closing_transport_number":
+        value = str(value).lstrip("#").strip()
+    await state.update_data(**{key: value})
+    await refresh_closing_preview(state, message.from_user, message.bot)
+    data = await state.get_data()
+    await state.set_state(ReportStates.choosing_edit_field)
+    label, _kind = spec
+    await message.answer(
+        f"✅ {label}: {escape(str(value))}\n\nЧто ещё поменять?",
+        reply_markup=edit_fields_kb(closing_edit_rows(data)),
+    )
+
+
+@router.callback_query(ReportStates.editing_field_value, F.data == "edit_time_now")
+async def edit_time_now(callback: CallbackQuery, state: FSMContext):
+    now = datetime.now().strftime("%H:%M")
+    await state.update_data(closing_time=now)
+    await refresh_closing_preview(state, callback.from_user, callback.bot)
+    data = await state.get_data()
+    await state.set_state(ReportStates.choosing_edit_field)
+    await callback.message.edit_text(
+        f"✅ Время: {now}\n\nЧто ещё поменять?",
+        reply_markup=edit_fields_kb(closing_edit_rows(data)),
+    )
+    await callback.answer()
+
+
+@router.message(ReportStates.editing_field_value)
+async def save_edited_field(message: Message, state: FSMContext):
+    data = await state.get_data()
+    spec = CLOSING_EDIT_BY_KEY.get(data.get("editing_key") or "")
+    if spec is None:
+        await message.answer("⚠️ Не вижу, какое поле менять. Нажми «✏️ Изменить» ещё раз.")
+        return
+    _label, kind = spec
+    if kind == "number":
+        value = await take_number(message)
+        if value is None:
+            return
+    else:
+        value = await take_text(message)
+        if value is None:
+            return
+    await store_edited_field(message, state, value)
+
+
+@router.callback_query(ReportStates.choosing_edit_field, F.data == "edit_done")
+async def finish_field_edit(callback: CallbackQuery, state: FSMContext):
+    report_text = await refresh_closing_preview(state, callback.from_user, callback.bot)
+    await state.set_state(ReportStates.confirming)
+    await callback.message.edit_text(
+        f"👀 Вот так уйдёт в чат:\n\n{escape(report_text)}\n\nОтправляем?",
+        reply_markup=confirm_kb(),
     )
     await callback.answer()
 
@@ -683,14 +815,19 @@ async def confirm_send(callback: CallbackQuery, state: FSMContext, bot: Bot):
     "fill_method:steps",
     "fill_method:one",
     "fill_method:turbo",
-    "turbo:nedovoz",
-    "turbo:preview_zero_nedovoz",
     "edit_report",
+    "edit_done",
+    "edit_time_now",
     "confirm_send",
     "machine_now",
     "closing_now",
 }))
 async def stale_report_button(callback: CallbackQuery):
+    await callback.answer("⏳ Эта кнопка уже не работает. Нажми «📋 Отчёт» и начни заново.", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("edit_field:"))
+async def stale_edit_field(callback: CallbackQuery):
     await callback.answer("⏳ Эта кнопка уже не работает. Нажми «📋 Отчёт» и начни заново.", show_alert=True)
 
 @router.callback_query(F.data == "cancel")
@@ -710,25 +847,80 @@ async def add_point_start(message: Message, state: FSMContext):
         return
     await ask_step("admin_point", state, message=message)
 
+def digits_point_number(text: str | None) -> str | None:
+    digits = re.sub(r"\D", "", text or "")
+    return digits or None
+
+def chat_id_from_message(message: Message) -> int | None:
+    if message.forward_from_chat:
+        return message.forward_from_chat.id
+    origin = message.forward_origin
+    if origin is not None:
+        for attr in ("chat", "sender_chat"):
+            chat = getattr(origin, attr, None)
+            if chat is not None and getattr(chat, "id", None) is not None:
+                return chat.id
+    text = (message.text or "").strip()
+    if re.fullmatch(r"-?\d+", text):
+        return int(text)
+    return None
+
+async def find_group_chat(bot: Bot, chat_id: int):
+    """Возвращает (chat, использованный id, пояснение). Для положительного id пробует минус."""
+    try:
+        chat = await bot.get_chat(chat_id)
+        return chat, chat_id, ""
+    except Exception:
+        pass
+    if chat_id > 0:
+        try:
+            chat = await bot.get_chat(-chat_id)
+            return chat, -chat_id, " Номер был без минуса — записал id группы."
+        except Exception:
+            pass
+    return None, chat_id, ""
+
 @router.message(AdminStates.waiting_point_number)
 async def add_point_number(message: Message, state: FSMContext):
-    await state.update_data(point_number=message.text.strip())
+    point_number = digits_point_number(message.text)
+    if not point_number:
+        await message.answer("✏️ Нужен номер ПП цифрами, например 1125 или ПП_1125.")
+        return
+    await state.update_data(point_number=point_number)
     await ask_step("admin_chat", state, message=message)
 
 @router.message(AdminStates.waiting_chat_id)
-async def add_point_chat(message: Message, state: FSMContext):
+async def add_point_chat(message: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
-    chat_id = message.forward_from_chat.id if message.forward_from_chat else None
-    if not chat_id and message.text and message.text.lstrip("-").isdigit():
-        chat_id = int(message.text.strip())
-    
-    if not chat_id:
-        await message.answer("🤷 Не вижу чат. Перешли сообщение из группы или напиши chat_id.")
+    point_number = digits_point_number(str(data.get("point_number") or ""))
+    if not point_number:
+        await message.answer("✏️ Сначала номер ПП. Нажми /add_point ещё раз.")
+        await state.clear()
+        return
+    entered = chat_id_from_message(message)
+    if entered is None:
+        await message.answer("🤷 Не вижу чат. Перешли сообщение из группы или напиши chat_id, например -5267492012.")
         return
 
-    await db.add_point(data["point_number"], chat_id)
+    chat, chat_id, note = await find_group_chat(bot, entered)
+    if chat is None:
+        await message.answer(
+            "⚠️ Telegram не нашёл этот чат. Добавь бота в группу пункта и пришли id с минусом "
+            "или перешли сообщение из этой группы."
+        )
+        return
+    if chat.type not in {"group", "supergroup"}:
+        title = escape(chat.title or getattr(chat, "full_name", None) or str(chat_id))
+        await message.answer(f"⚠️ Нашёл «{title}», это не группа пункта. Нужен чат, куда уходят отчёты.")
+        return
+
+    await db.add_point(point_number, chat_id, title=chat.title)
     await state.clear()
-    await message.answer(f"✅ Чат для ПП_{data['point_number']} сохранил.")
+    title = escape(chat.title or str(chat_id))
+    await message.answer(
+        f"✅ Чат для ПП_{point_number} сохранил: {title}.{escape(note)}\n"
+        f"chat_id: <code>{chat_id}</code>"
+    )
 
 def format_place(place: dict, heading: bool = True, note: str = "") -> str:
     pp = escape(str(place["pp_number"]))
