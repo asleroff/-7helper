@@ -80,6 +80,108 @@ async def get_by_ozon(ozon_id: str) -> Optional[dict]:
     return await _get_by("ozon_id", ozon_id)
 
 
+async def get_place_row(rowid: int) -> Optional[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT rowid, pp_number, ozon_id, address FROM places WHERE rowid = ?",
+            (rowid,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+
+async def find_places(query: str) -> list[dict]:
+    raw = query.strip()
+    ozon_id = extract_ozon_id(raw)
+    pp_number = extract_pp(raw)
+    compact = re.sub(r"\s+", "", raw)
+    if compact.isdigit():
+        ozon_id = ozon_id or compact
+        pp_number = pp_number or compact
+    clauses = []
+    params = []
+    if pp_number:
+        clauses.append("pp_number = ?")
+        params.append(pp_number)
+    if ozon_id:
+        clauses.append("ozon_id = ?")
+        params.append(ozon_id)
+    if not clauses:
+        return []
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            f"SELECT rowid, pp_number, ozon_id, address FROM places WHERE {' OR '.join(clauses)}",
+            params,
+        ) as cursor:
+            return [dict(row) for row in await cursor.fetchall()]
+
+
+async def update_place_field(rowid: int, field: str, value: str) -> None:
+    if field not in {"pp_number", "ozon_id", "address"}:
+        raise ValueError("field")
+    current = await get_place_row(rowid)
+    if current is None:
+        raise LookupError("missing")
+    if field == "pp_number":
+        owner = await get_by_pp(value)
+        if owner:
+            owner_row = await find_places(value)
+            if any(row["rowid"] != rowid and row["pp_number"] == value for row in owner_row):
+                raise ValueError(f"ПП_{value}")
+        assignments = "pp_number = ?"
+        params = [value]
+    elif field == "ozon_id":
+        owner = await get_by_ozon(value)
+        if owner:
+            rows = await find_places(value)
+            if any(row["rowid"] != rowid and row["ozon_id"] == value for row in rows):
+                raise ValueError(f"ПП_{owner['pp_number'] or 'без номера'}")
+        assignments = "ozon_id = ?"
+        params = [value]
+    else:
+        assignments = "address = ?, address_norm = ?"
+        params = [value.strip(), normalize_text(value)]
+    params.append(rowid)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(f"UPDATE places SET {assignments} WHERE rowid = ?", params)
+        await db.commit()
+
+
+async def list_places() -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """SELECT pp_number, ozon_id, address
+               FROM places
+               ORDER BY CASE WHEN pp_number IS NULL OR pp_number = '' THEN 1 ELSE 0 END,
+                        CAST(pp_number AS INTEGER),
+                        pp_number"""
+        ) as cursor:
+            return [dict(row) for row in await cursor.fetchall()]
+
+
+def build_places_pdf(places: list[dict]) -> bytes:
+    from fpdf import FPDF
+
+    pdf = FPDF(orientation="P", unit="mm", format="A4")
+    pdf.add_font("Arial", fname=r"C:\Windows\Fonts\arial.ttf")
+    pdf.set_auto_page_break(auto=True, margin=12)
+    pdf.add_page()
+    pdf.set_font("Arial", size=14)
+    pdf.cell(0, 8, f"Адреса пунктов: {len(places)}", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(2)
+    pdf.set_font("Arial", size=9)
+    for place in places:
+        pp = place.get("pp_number") or "—"
+        ozon = place.get("ozon_id") or "—"
+        address = (place.get("address") or "").replace("\n", " ")
+        pdf.set_x(pdf.l_margin)
+        pdf.multi_cell(pdf.epw, 5, f"ПП_{pp}    {ozon}    {address}")
+    return bytes(pdf.output())
+
+
 async def save_place(pp_number: str, ozon_id: Optional[str], address: str) -> str:
     if ozon_id:
         owner = await get_by_ozon(ozon_id)

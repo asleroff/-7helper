@@ -1,6 +1,6 @@
 from aiogram import BaseMiddleware, Router, F, Bot
 from aiogram.enums import ChatType
-from aiogram.types import Message, CallbackQuery, LinkPreviewOptions
+from aiogram.types import Message, CallbackQuery, LinkPreviewOptions, BufferedInputFile
 from aiogram.filters import Command, CommandStart
 from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.fsm.context import FSMContext
@@ -840,7 +840,7 @@ async def cancel_handler(callback: CallbackQuery, state: FSMContext):
 async def my_id(message: Message):
     await message.answer(f"🪪 Твой ID: {message.from_user.id}")
 
-@router.message(Command("add_point"))
+@router.message(Command("add_chat_to_pp"))
 async def add_point_start(message: Message, state: FSMContext):
     if not await db.is_admin(message.from_user.id):
         await message.answer("🔒 Эта команда только для администратора.")
@@ -894,7 +894,7 @@ async def add_point_chat(message: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
     point_number = digits_point_number(str(data.get("point_number") or ""))
     if not point_number:
-        await message.answer("✏️ Сначала номер ПП. Нажми /add_point ещё раз.")
+        await message.answer("✏️ Сначала номер ПП. Нажми /add_chat_to_pp ещё раз.")
         await state.clear()
         return
     entered = chat_id_from_message(message)
@@ -922,10 +922,76 @@ async def add_point_chat(message: Message, state: FSMContext, bot: Bot):
         f"chat_id: <code>{chat_id}</code>"
     )
 
+
+@router.message(Command("edit_chat_to_pp"))
+async def rebind_chat_start(message: Message, state: FSMContext):
+    if not await db.is_admin(message.from_user.id):
+        await message.answer("🔒 Эта команда только для администратора.")
+        return
+    await state.set_state(AdminStates.waiting_rebind_pp)
+    await message.answer("🔁 Какой ПП перепривязать? Например 1125 или ПП_1125.", reply_markup=step_kb())
+
+
+@router.message(AdminStates.waiting_rebind_pp, F.text)
+async def rebind_chat_pp(message: Message, state: FSMContext):
+    point_number = digits_point_number(message.text)
+    if not point_number:
+        await message.answer("✏️ Нужен номер ПП цифрами, например 1125.")
+        return
+    point = await db.get_point(point_number)
+    if not point:
+        await message.answer(f"⚠️ ПП_{point_number} ещё не привязан. Сначала /add_chat_to_pp.")
+        return
+    await state.update_data(point_number=point_number)
+    await state.set_state(AdminStates.waiting_rebind_chat)
+    title = escape(point.get("title") or "без названия")
+    await message.answer(
+        f"ПП_{point_number} сейчас привязан к «{title}».\n"
+        f"chat_id: <code>{point['chat_id']}</code>\n\n"
+        "Перешли любое сообщение из нового чата или напиши его chat_id.",
+        reply_markup=step_kb(),
+    )
+
+
+@router.message(AdminStates.waiting_rebind_chat)
+async def rebind_chat_save(message: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    point_number = digits_point_number(str(data.get("point_number") or ""))
+    if not point_number:
+        await message.answer("✏️ Сначала номер ПП. Нажми /edit_chat_to_pp ещё раз.")
+        await state.clear()
+        return
+    entered = chat_id_from_message(message)
+    if entered is None:
+        await message.answer("🤷 Не вижу чат. Перешли сообщение из группы или напиши chat_id, например -5267492012.")
+        return
+    chat, chat_id, note = await find_group_chat(bot, entered)
+    if chat is None:
+        await message.answer(
+            "⚠️ Telegram не нашёл этот чат. Добавь бота в новую группу и пришли id с минусом "
+            "или перешли сообщение из неё."
+        )
+        return
+    if chat.type not in {"group", "supergroup"}:
+        title = escape(chat.title or getattr(chat, "full_name", None) or str(chat_id))
+        await message.answer(f"⚠️ Нашёл «{title}», это не группа. Нужен чат, куда уходят отчёты.")
+        return
+    await db.add_point(point_number, chat_id, title=chat.title)
+    await state.clear()
+    title = escape(chat.title or str(chat_id))
+    await message.answer(
+        f"✅ ПП_{point_number} теперь привязан к «{title}».{escape(note)}\n"
+        f"chat_id: <code>{chat_id}</code>"
+    )
+
 def format_place(place: dict, heading: bool = True, note: str = "") -> str:
-    pp = escape(str(place["pp_number"]))
+    pp_raw = place.get("pp_number")
     address = escape(str(place["address"]))
-    lines = [f"<b>ПП_{pp}</b>{note}"] if heading else []
+    if heading:
+        title = f"ПП_{escape(str(pp_raw))}" if pp_raw else "ПП пока не указан"
+        lines = [f"<b>{title}</b>{note}"]
+    else:
+        lines = []
     ozon = place.get("ozon_id")
     if ozon:
         ozon = escape(str(ozon))
@@ -967,7 +1033,143 @@ async def search_place(message: Message):
         return
     await message.answer(format_search_results(places))
 
-@router.message(Command("add_place"))
+@router.message(Command("all_command"))
+async def all_commands(message: Message):
+    if not await db.is_admin(message.from_user.id):
+        await message.answer("🔒 Эта команда только для администратора.")
+        return
+    await message.answer(
+        "<b>Команды</b>\n\n"
+        "/start — начать заново\n"
+        "/find — найти пункт по ПП, номеру Ozon или адресу\n"
+        "/report — отправить отчёт в чат пункта\n"
+        "/stats — статистика закрытий за 3, 7 или 30 дней\n"
+        "/help — краткая справка\n"
+        "/my_id — показать ваш Telegram ID\n\n"
+        "<b>Только администратор</b>\n"
+        "/add_chat_to_pp — привязать ПП к чату группы\n"
+        "/edit_chat_to_pp — перепривязать ПП к другому чату\n"
+        "/add_pp — записать пункт: ПП, номер Ozon и адрес\n"
+        "/all_point — PDF со всеми адресами\n"
+        "/edit_pp — изменить ПП, номер пункта или адрес\n"
+        "/all_command — этот список",
+    )
+
+
+@router.message(Command("all_point"))
+async def all_points(message: Message):
+    if not await db.is_admin(message.from_user.id):
+        await message.answer("🔒 Эта команда только для администратора.")
+        return
+    places = await addresses.list_places()
+    if not places:
+        await message.answer("📭 Адресов пока нет.")
+        return
+    pdf = addresses.build_places_pdf(places)
+    await message.answer_document(
+        BufferedInputFile(pdf, filename="addresses.pdf"),
+        caption=f"Адреса пунктов: {len(places)}",
+    )
+
+
+def edit_place_text(place: dict) -> str:
+    return "✏️ Что меняем?\n\n" + format_place(place)
+
+
+@router.message(Command("edit_pp"))
+async def edit_point_start(message: Message, state: FSMContext):
+    if not await db.is_admin(message.from_user.id):
+        await message.answer("🔒 Эта команда только для администратора.")
+        return
+    await state.set_state(AdminStates.waiting_edit_place_query)
+    await message.answer(
+        "✏️ Какой пункт меняем? Пришли номер ПП, номер пункта или ссылку ozon.ru/point/...",
+        reply_markup=step_kb(),
+    )
+
+
+@router.message(AdminStates.waiting_edit_place_query, F.text)
+async def edit_point_query(message: Message, state: FSMContext):
+    places = await addresses.find_places(message.text or "")
+    if not places:
+        await message.answer("🤷 Такого пункта нет. Пришли номер ПП или номер пункта.")
+        return
+    if len(places) > 1:
+        await message.answer("Нашёл несколько. Пришли только номер ПП или только номер пункта.")
+        return
+    place = places[0]
+    await state.update_data(edit_place_rowid=place["rowid"])
+    await state.set_state(AdminStates.choosing_edit_place_field)
+    await message.answer(edit_place_text(place), reply_markup=edit_place_kb())
+
+
+@router.callback_query(AdminStates.choosing_edit_place_field, F.data == "edit_place:done")
+async def edit_point_done(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("✅ Готово, пункт обновлён.")
+    await callback.answer()
+
+
+@router.callback_query(AdminStates.choosing_edit_place_field, F.data.startswith("edit_place:"))
+async def edit_point_choose(callback: CallbackQuery, state: FSMContext):
+    field = callback.data.split(":", 1)[1]
+    prompts = {
+        "pp": "🏷 Новый номер ПП, например 1125:",
+        "ozon": "🔗 Новый номер пункта или ссылка ozon.ru/point/...:",
+        "address": "📍 Новый адрес:",
+    }
+    if field not in prompts:
+        await callback.answer()
+        return
+    await state.update_data(edit_place_field=field)
+    await state.set_state(AdminStates.waiting_edit_place_value)
+    await callback.message.edit_text(prompts[field], reply_markup=step_kb())
+    await callback.answer()
+
+
+@router.message(AdminStates.waiting_edit_place_value, F.text)
+async def edit_point_value(message: Message, state: FSMContext):
+    data = await state.get_data()
+    rowid = data.get("edit_place_rowid")
+    field = data.get("edit_place_field")
+    text = (message.text or "").strip()
+    if field == "pp":
+        value = addresses.extract_pp(text) or (text if text.isdigit() else None)
+        if not value:
+            await message.answer("✏️ Нужен номер ПП цифрами, например 1125.")
+            return
+        column = "pp_number"
+    elif field == "ozon":
+        value = addresses.extract_ozon_id(text) or (text if text.isdigit() else None)
+        if not value:
+            await message.answer("✏️ Пришли номер пункта цифрами или ссылку ozon.ru/point/...")
+            return
+        column = "ozon_id"
+    elif field == "address":
+        if len(text) < 3:
+            await message.answer("📏 Адрес слишком короткий.")
+            return
+        value = text
+        column = "address"
+    else:
+        await message.answer("⚠️ Нажми /edit_pp и начни заново.")
+        await state.clear()
+        return
+    try:
+        await addresses.update_place_field(rowid, column, value)
+    except ValueError as error:
+        await message.answer(f"⚠️ Это уже занято: {error}")
+        return
+    except LookupError:
+        await state.clear()
+        await message.answer("⚠️ Пункт уже не найден. Нажми /edit_pp ещё раз.")
+        return
+    place = await addresses.get_place_row(rowid)
+    await state.set_state(AdminStates.choosing_edit_place_field)
+    await message.answer(edit_place_text(place), reply_markup=edit_place_kb())
+
+
+@router.message(Command("add_pp"))
 async def add_place_start(message: Message, state: FSMContext):
     if not await db.is_admin(message.from_user.id):
         await message.answer("🔒 Эта команда только для администратора.")

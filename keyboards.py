@@ -37,6 +37,16 @@ def edit_fields_kb(rows: list[tuple[str, str]]):
     builder.adjust(1)
     return builder.as_markup()
 
+def edit_place_kb():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Номер ПП", callback_data="edit_place:pp")
+    builder.button(text="Номер пункта", callback_data="edit_place:ozon")
+    builder.button(text="Адрес", callback_data="edit_place:address")
+    builder.button(text="✅ Готово", callback_data="edit_place:done")
+    builder.button(text="❌ Отмена", callback_data="cancel")
+    builder.adjust(1)
+    return builder.as_markup()
+
 def confirm_kb():
     builder = InlineKeyboardBuilder()
     builder.button(text="✅ Отправить в чат", callback_data="confirm_send")

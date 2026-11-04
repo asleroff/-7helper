@@ -33,6 +33,11 @@ class SearchStates(StatesGroup):
 class AdminStates(StatesGroup):
     waiting_point_number = State()
     waiting_chat_id = State()
+    waiting_rebind_pp = State()
+    waiting_rebind_chat = State()
     waiting_place_pp = State()
     waiting_place_ozon = State()
     waiting_place_address = State()
+    waiting_edit_place_query = State()
+    choosing_edit_place_field = State()
+    waiting_edit_place_value = State()
