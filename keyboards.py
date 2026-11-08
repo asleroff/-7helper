@@ -4,9 +4,10 @@ def main_menu_kb():
     builder = ReplyKeyboardBuilder()
     builder.button(text="🔍 Найти пункт")
     builder.button(text="📋 Отчёт")
+    builder.button(text="🚚 Водитель")
     builder.button(text="📊 Статистика")
     builder.button(text="ℹ️ Помощь")
-    builder.adjust(1, 1, 2)
+    builder.adjust(1, 1, 1, 2)
     return builder.as_markup(resize_keyboard=True)
 
 def report_type_kb():

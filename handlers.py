@@ -7,17 +7,34 @@ from aiogram.fsm.context import FSMContext
 from datetime import datetime
 from html import escape
 from urllib.parse import quote
+import asyncio
 import re
 
-from states import ReportStates, StatsStates, SearchStates, AdminStates
+from io import BytesIO
+
+from aiogram.exceptions import TelegramNetworkError
+
+from states import ReportStates, StatsStates, SearchStates, AdminStates, DriverStates
 from keyboards import *
 import addresses
+import couriers
 import database as db
 import turbo_draft
+
+MENU_BUTTONS = {
+    "📋 Отчёт",
+    "🔍 Найти пункт",
+    "🚚 Водитель",
+    "ℹ️ Помощь",
+    "📊 Статистика",
+}
 
 router = Router()
 router.message.filter(F.chat.type == ChatType.PRIVATE)
 router.callback_query.filter(F.message.chat.type == ChatType.PRIVATE)
+
+intake_router = Router()
+COURIER_CHAT_IDS = {-5450101186, -1005450101186}
 
 
 class RememberUserMiddleware(BaseMiddleware):
@@ -44,7 +61,8 @@ async def cmd_start(message: Message, state: FSMContext):
     await message.answer(
         "👋 Привет. Помогу найти пункт или отправить отчёт.\n\n"
         "«🔍 Найти пункт» — номер ПП, номер из ссылки или адрес.\n"
-        "«📋 Отчёт» — текст уйдёт в чат пункта.",
+        "«📋 Отчёт» — текст уйдёт в чат пункта.\n"
+        "«🚚 Водитель» — кто сегодня едет на пункт.",
         reply_markup=main_menu_kb()
     )
 
@@ -81,6 +99,10 @@ async def show_help(message: Message):
         "📊 <b>Статистика</b>\n"
         "Напиши номер ПП и выбери 3, 7 или 30 дней. "
         "Покажу приёмку, выдачу и остаток по закрытиям этого пункта.\n\n"
+        "🚚 <b>Водитель</b>\n"
+        "Утром в чат со списками присылают xlsx «Список курьерских выдач». "
+        "Нажми «🚚 Водитель» и напиши номер ПП: покажу водителя, телефон "
+        "и остальные пункты его маршрута.\n\n"
         "❓ Если запутался или что-то не работает, напиши создателю: "
         "<a href=\"https://t.me/petyunyka\">@petyunyka</a>",
         reply_markup=main_menu_kb(),
@@ -99,7 +121,7 @@ async def start_stats(message: Message, state: FSMContext):
 
 @router.message(StatsStates.waiting_point_number)
 async def stats_point_number(message: Message, state: FSMContext):
-    if message.text in {"📋 Отчёт", "🔍 Найти пункт", "ℹ️ Помощь", "📊 Статистика"}:
+    if message.text in MENU_BUTTONS:
         raise SkipHandler()
     if not message.text or not message.text.strip():
         await message.answer("💬 Напиши номер ПП цифрами, например 1125.")
@@ -147,6 +169,8 @@ async def start_report(message: Message, state: FSMContext):
 
 @router.message(ReportStates.waiting_point_number)
 async def process_point_number(message: Message, state: FSMContext):
+    if message.text in MENU_BUTTONS:
+        raise SkipHandler()
     if not message.text or not message.text.strip():
         await message.answer("✏️ Напиши номер ПП цифрами, например 1125.")
         return
@@ -1022,6 +1046,8 @@ def format_search_results(places: list[dict]) -> str:
 
 @router.message(SearchStates.waiting_query)
 async def search_place(message: Message):
+    if message.text in MENU_BUTTONS:
+        raise SkipHandler()
     if not message.text or not message.text.strip():
         await message.answer("💬 Нужен текст: номер, ссылка или адрес.")
         return
@@ -1032,6 +1058,147 @@ async def search_place(message: Message):
         )
         return
     await message.answer(format_search_results(places))
+
+
+def format_driver_answer(point_number: str, load: dict, people: list[dict]) -> str:
+    when = escape(load["route_date"] or "дата в файле не указана")
+    lines = [f"🚚 <b>ПП_{escape(point_number)}</b>", f"Список на {when}"]
+    if not people:
+        lines.append("Этого пункта в списке нет.")
+        return "\n".join(lines)
+    for person in people:
+        lines.append("")
+        lines.append(escape(person["name"]))
+        phone = (person.get("phone") or "").strip()
+        lines.append(f"📞 {escape(phone)}" if phone else "📞 Телефон в файле не указан")
+        others = [point for point in person["points"] if point != point_number]
+        if others:
+            route = ", ".join(f"ПП_{escape(point)}" for point in others)
+            lines.append(f"Ещё заедет: {route}")
+        else:
+            lines.append("Других пунктов на этом маршруте нет.")
+    return "\n".join(lines)
+
+
+@router.message(F.text == "🚚 Водитель")
+@router.message(Command("driver"))
+async def start_driver(message: Message, state: FSMContext):
+    await state.clear()
+    load = await db.courier_load()
+    if not load:
+        await message.answer(
+            "Утренний список ещё не присылали. Нужен xlsx «Список курьерских выдач».",
+            reply_markup=main_menu_kb(),
+        )
+        return
+    await state.set_state(DriverStates.waiting_point_number)
+    when = escape(load["route_date"] or "без даты")
+    await message.answer(
+        f"🚚 Список на {when} уже есть.\nНапиши номер ПП, например 1125.",
+        reply_markup=main_menu_kb(),
+    )
+
+
+@router.message(DriverStates.waiting_point_number)
+async def driver_point_number(message: Message, state: FSMContext):
+    if message.text in MENU_BUTTONS:
+        raise SkipHandler()
+    if not message.text or not message.text.strip():
+        await message.answer("Напиши номер ПП цифрами, например 1125.")
+        return
+    point_number = re.sub(r"\D", "", message.text)
+    if not point_number:
+        await message.answer("Напиши номер ПП цифрами, например 1125.")
+        return
+    load = await db.courier_load()
+    if not load:
+        await state.clear()
+        await message.answer("Утренний список уже не сохранён. Пришлите файл ещё раз.")
+        return
+    people = await db.couriers_for_point(point_number)
+    await message.answer(format_driver_answer(point_number, load, people))
+
+
+_courier_groups: dict[str, list[Message]] = {}
+_courier_groups_lock = asyncio.Lock()
+_courier_batch_lock = asyncio.Lock()
+
+
+def _xlsx_name(message: Message) -> str:
+    name = (message.document.file_name if message.document else "") or ""
+    return name if name.lower().endswith(".xlsx") else ""
+
+
+async def _download_xlsx(bot: Bot, message: Message) -> bytes:
+    last_error = None
+    for attempt in range(4):
+        try:
+            buffer = BytesIO()
+            await bot.download(message.document, destination=buffer)
+            return buffer.getvalue()
+        except TelegramNetworkError as exc:
+            last_error = exc
+            await asyncio.sleep(2 + attempt)
+    raise last_error
+
+
+async def _store_courier_files(messages: list[Message], bot: Bot) -> None:
+    files = [message for message in messages if _xlsx_name(message)]
+    if not files:
+        return
+    async with _courier_batch_lock:
+        lines = [f"Принял файлов: {len(files)}"]
+        total = None
+        for message in files:
+            file_name = _xlsx_name(message)
+            try:
+                payload = await _download_xlsx(bot, message)
+                parsed = couriers.parse_courier_file(payload)
+                total = await db.save_courier_load(parsed["route_date"], file_name, parsed["couriers"])
+                lines.append(
+                    f"• {escape(file_name)}: {total['file_couriers']} водителей, {total['file_points']} пунктов"
+                )
+            except couriers.CourierFileError as exc:
+                lines.append(f"• {escape(file_name)}: не прочитал, {escape(str(exc))}")
+            except TelegramNetworkError:
+                lines.append(f"• {escape(file_name)}: не скачался, сеть оборвалась")
+        if total:
+            lines.append(
+                f"Всего за сегодня: {total['total_couriers']} водителей, {total['total_points']} пунктов."
+            )
+        await files[0].answer("\n".join(lines))
+
+
+async def _flush_courier_group(group_id: str, bot: Bot) -> None:
+    previous = 0
+    for _ in range(8):
+        await asyncio.sleep(0.7)
+        async with _courier_groups_lock:
+            current = len(_courier_groups.get(group_id, []))
+        if current and current == previous:
+            break
+        previous = current
+    async with _courier_groups_lock:
+        messages = _courier_groups.pop(group_id, [])
+    if messages:
+        await _store_courier_files(messages, bot)
+
+
+@intake_router.message(F.document, F.chat.id.in_(COURIER_CHAT_IDS))
+async def take_courier_file(message: Message, bot: Bot):
+    if not _xlsx_name(message):
+        return
+    group_id = message.media_group_id
+    if not group_id:
+        await _store_courier_files([message], bot)
+        return
+    async with _courier_groups_lock:
+        bucket = _courier_groups.setdefault(group_id, [])
+        bucket.append(message)
+        first = len(bucket) == 1
+    if first:
+        asyncio.create_task(_flush_courier_group(group_id, bot))
+
 
 @router.message(Command("all_command"))
 async def all_commands(message: Message):
@@ -1045,6 +1212,7 @@ async def all_commands(message: Message):
         "/report — отправить отчёт в чат пункта\n"
         "/stats — статистика закрытий за 3, 7 или 30 дней\n"
         "/help — краткая справка\n"
+        "/driver — кто сегодня едет на пункт\n"
         "/my_id — показать ваш Telegram ID\n\n"
         "<b>Только администратор</b>\n"
         "/add_chat_to_pp — привязать ПП к чату группы\n"

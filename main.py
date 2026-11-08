@@ -7,7 +7,7 @@ from aiogram.enums import ParseMode
 from dotenv import load_dotenv
 import os
 
-from handlers import router
+from handlers import intake_router, router
 import addresses
 import database as db
 
@@ -27,6 +27,7 @@ async def main():
 
     bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(intake_router)
     dp.include_router(router)
 
     print("Бот запущен...")

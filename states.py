@@ -30,6 +30,9 @@ class StatsStates(StatesGroup):
 class SearchStates(StatesGroup):
     waiting_query = State()
 
+class DriverStates(StatesGroup):
+    waiting_point_number = State()
+
 class AdminStates(StatesGroup):
     waiting_point_number = State()
     waiting_chat_id = State()
