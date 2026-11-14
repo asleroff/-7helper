@@ -1,7 +1,7 @@
 import re
 import zipfile
 import xml.etree.ElementTree as ET
-from collections import Counter
+from datetime import datetime
 from io import BytesIO
 
 NS = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
@@ -129,5 +129,203 @@ def parse_courier_file(payload: bytes) -> dict:
     if not couriers:
         raise CourierFileError("В файле нет пунктов вида ПП_1125")
 
-    route_date = Counter(dates).most_common(1)[0][0] if dates else ""
-    return {"route_date": route_date, "couriers": list(couriers.values())}
+    return {"route_date": latest_route_date(dates), "couriers": list(couriers.values())}
+
+
+def _parse_route_datetime(value: str) -> datetime | None:
+    text = (value or "").strip()
+    if not text:
+        return None
+    for fmt in (
+        "%d.%m.%Y %H:%M:%S",
+        "%d.%m.%Y %H:%M",
+        "%d.%m.%Y",
+        "%d.%m.%y %H:%M:%S",
+        "%d.%m.%y %H:%M",
+        "%d.%m.%y",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
+    ):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def latest_route_date(values: list[str]) -> str:
+    """Из нескольких дат файлов оставляет самую позднюю, без времени."""
+    best: datetime | None = None
+    fallback = ""
+    for value in values:
+        text = (value or "").strip()
+        if not text:
+            continue
+        fallback = text
+        parsed = _parse_route_datetime(text)
+        if parsed is not None and (best is None or parsed > best):
+            best = parsed
+    if best is None:
+        return fallback
+    return best.strftime("%d.%m.%Y")
+
+
+_REPLACEMENT_HEAD = re.compile(
+    r"^замена\b(?:\s+(\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?))?",
+    re.IGNORECASE,
+)
+_INSTEAD = re.compile(r"^вместо\b\s*(.*)$", re.IGNORECASE)
+_PP_LINE = re.compile(r"^(?:пп|pp)\s*:\s*(.+)$", re.IGNORECASE)
+
+
+def phone_key(value: str) -> str:
+    digits = re.sub(r"\D", "", value or "")
+    if len(digits) < 10:
+        return ""
+    return digits[-10:]
+
+
+def person_names(value: str) -> tuple[str, str]:
+    text = (value or "").casefold().replace("ё", "е")
+    text = re.sub(r"[^a-zа-я\s-]", " ", text)
+    parts = [part for part in re.split(r"[\s-]+", text) if part]
+    surname = parts[0] if parts else ""
+    first = parts[1] if len(parts) > 1 else ""
+    return surname, first
+
+
+def same_courier(name_a: str, phone_a: str, name_b: str, phone_b: str) -> bool:
+    left_phone = phone_key(phone_a)
+    right_phone = phone_key(phone_b)
+    if left_phone and right_phone and left_phone == right_phone:
+        return True
+    surname_a, first_a = person_names(name_a)
+    surname_b, first_b = person_names(name_b)
+    if not surname_a or surname_a != surname_b:
+        return False
+    if not first_a or not first_b:
+        return True
+    return first_a == first_b or first_a.startswith(first_b) or first_b.startswith(first_a)
+
+
+def _phone_line(line: str) -> str:
+    compact = re.sub(r"[\s\-()]", "", line.strip())
+    if not re.fullmatch(r"\+?\d{10,12}", compact):
+        return ""
+    return compact.lstrip("+")
+
+
+def _name_and_phone(lines: list[str]) -> tuple[str, str]:
+    phone = ""
+    names = []
+    for line in lines:
+        found = _phone_line(line)
+        if found:
+            phone = found
+            continue
+        if line.strip():
+            names.append(line.strip())
+    return " ".join(names).strip(), phone
+
+
+def _parse_replacement_block(date: str, source: list[str]) -> dict | None:
+    warehouse = ""
+    body = []
+    for line in source:
+        if line.casefold().startswith("склад"):
+            warehouse = line
+            continue
+        body.append(line)
+    instead_at = None
+    old_inline = ""
+    for index, line in enumerate(body):
+        match = _INSTEAD.match(line)
+        if match:
+            instead_at = index
+            old_inline = match.group(1).strip()
+            break
+    if instead_at is None:
+        return None
+    new_name, new_phone = _name_and_phone(body[:instead_at])
+    points: list[str] = []
+    old_lines = [old_inline] if old_inline else []
+    for line in body[instead_at + 1:]:
+        point_line = _PP_LINE.match(line)
+        if point_line:
+            points.extend(re.findall(r"\d+", point_line.group(1)))
+            continue
+        old_lines.append(line)
+    old_name, old_phone = _name_and_phone(old_lines)
+    if not new_name or not old_name:
+        return None
+    unique_points = []
+    for point in points:
+        if point not in unique_points:
+            unique_points.append(point)
+    return {
+        "date": date,
+        "warehouse": warehouse,
+        "new_name": new_name,
+        "new_phone": new_phone,
+        "old_name": old_name,
+        "old_phone": old_phone,
+        "points": unique_points,
+    }
+
+
+def parse_replacements(text: str) -> list[dict]:
+    """Сообщения «Замена»: новый водитель, затем «вместо» и старый, ПП по желанию."""
+    blocks: list[dict] = []
+    current: dict | None = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        head = _REPLACEMENT_HEAD.match(line)
+        if head:
+            if current:
+                blocks.append(current)
+            current = {"date": head.group(1) or "", "lines": []}
+            continue
+        if current is not None and line:
+            current["lines"].append(line)
+    if current:
+        blocks.append(current)
+    parsed = []
+    for block in blocks:
+        item = _parse_replacement_block(block["date"], block["lines"])
+        if item:
+            parsed.append(item)
+    return parsed
+
+
+def collapse_replacements(items: list[dict]) -> list[dict]:
+    """Если одну замену прислали и без ПП, и со списком ПП — берём только список."""
+    groups: list[dict] = []
+    index: dict[tuple[str, str], int] = {}
+    for item in items:
+        key = (person_names(item["old_name"]), person_names(item["new_name"]))
+        if key not in index:
+            index[key] = len(groups)
+            groups.append({
+                **item,
+                "points": list(item.get("points") or []),
+                "limited": bool(item.get("points")),
+            })
+            continue
+        group = groups[index[key]]
+        if not group["new_phone"] and item.get("new_phone"):
+            group["new_phone"] = item["new_phone"]
+        if not group["old_phone"] and item.get("old_phone"):
+            group["old_phone"] = item["old_phone"]
+        if item.get("points"):
+            if not group["limited"]:
+                group["points"] = []
+                group["limited"] = True
+            for point in item["points"]:
+                if point not in group["points"]:
+                    group["points"].append(point)
+    for group in groups:
+        if not group["limited"]:
+            group["points"] = None
+        group.pop("limited", None)
+    return groups

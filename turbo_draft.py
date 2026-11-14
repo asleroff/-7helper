@@ -87,6 +87,7 @@ def closing_fields_from_draft(payload: dict[str, Any]) -> dict[str, Any]:
         "closing_zasyl": num("zasyl"),
         "closing_issued": num("issued"),
         "closing_leftover": num("leftover"),
+        "closing_ozon_shelf": num("ozon_shelf"),
         "turbo_collected_at": draft.get("collected_at") or payload.get("saved_at"),
         "turbo_preview_text": payload.get("preview_text"),
     }

@@ -1,5 +1,5 @@
 from aiogram import BaseMiddleware, Router, F, Bot
-from aiogram.enums import ChatType
+from aiogram.enums import ChatMemberStatus, ChatType
 from aiogram.types import Message, CallbackQuery, LinkPreviewOptions, BufferedInputFile
 from aiogram.filters import Command, CommandStart
 from aiogram.dispatcher.event.bases import SkipHandler
@@ -9,10 +9,11 @@ from html import escape
 from urllib.parse import quote
 import asyncio
 import re
+import time
 
 from io import BytesIO
 
-from aiogram.exceptions import TelegramNetworkError
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 
 from states import ReportStates, StatsStates, SearchStates, AdminStates, DriverStates
 from keyboards import *
@@ -34,7 +35,15 @@ router.message.filter(F.chat.type == ChatType.PRIVATE)
 router.callback_query.filter(F.message.chat.type == ChatType.PRIVATE)
 
 intake_router = Router()
-COURIER_CHAT_IDS = {-5450101186, -1005450101186}
+# Один и тот же чат со списками водителей: короткий id и id супергруппы.
+STAFF_CHAT_IDS = (-1005450101186, -5450101186)
+COURIER_CHAT_IDS = set(STAFF_CHAT_IDS)
+_STAFF_OK = {
+    ChatMemberStatus.CREATOR,
+    ChatMemberStatus.ADMINISTRATOR,
+    ChatMemberStatus.MEMBER,
+}
+_staff_cache: dict[int, tuple[float, str]] = {}
 
 
 class RememberUserMiddleware(BaseMiddleware):
@@ -48,7 +57,75 @@ class RememberUserMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 
-router.message.middleware(RememberUserMiddleware())
+def _member_allowed(member) -> bool:
+    if member.status in _STAFF_OK:
+        return True
+    if member.status == ChatMemberStatus.RESTRICTED:
+        return bool(getattr(member, "is_member", False))
+    return False
+
+
+async def staff_membership(bot: Bot, user_id: int) -> str:
+    """yes — состоит в чате со списками, no — нет, error — Telegram не ответил."""
+    cached = _staff_cache.get(user_id)
+    now = time.monotonic()
+    if cached and cached[0] > now:
+        return cached[1]
+
+    saw_chat = False
+    for chat_id in STAFF_CHAT_IDS:
+        try:
+            member = await bot.get_chat_member(chat_id, user_id)
+        except TelegramBadRequest as exc:
+            text = str(exc).lower()
+            if "user not found" in text or "participant" in text or "member not found" in text:
+                saw_chat = True
+                continue
+            continue
+        except TelegramNetworkError:
+            return "error"
+        saw_chat = True
+        status = "yes" if _member_allowed(member) else "no"
+        _staff_cache[user_id] = (now + (120 if status == "yes" else 20), status)
+        return status
+    status = "no" if saw_chat else "error"
+    if status == "no":
+        _staff_cache[user_id] = (now + 20, status)
+    return status
+
+
+class StaffOnlyMiddleware(BaseMiddleware):
+    def __init__(self):
+        self._remember = RememberUserMiddleware()
+
+    async def __call__(self, handler, event, data):
+        user = getattr(event, "from_user", None)
+        if user is None or user.is_bot:
+            return await handler(event, data)
+        bot = data["bot"]
+        status = await staff_membership(bot, user.id)
+        if status == "yes":
+            return await self._remember(handler, event, data)
+        state = data.get("state")
+        if state is not None:
+            await state.clear()
+        if status == "error":
+            text = "Не удалось проверить доступ. Напиши ещё раз через минуту."
+        else:
+            text = (
+                "Бот только для сотрудников.\n"
+                "Нужно состоять в чате, куда присылают списки водителей."
+            )
+        if isinstance(event, CallbackQuery):
+            await event.answer(text, show_alert=True)
+            return
+        if isinstance(event, Message):
+            await event.answer(text)
+        return
+
+
+router.message.middleware(StaffOnlyMiddleware())
+router.callback_query.middleware(StaffOnlyMiddleware())
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
@@ -85,6 +162,8 @@ async def start_search(message: Message, state: FSMContext):
 async def show_help(message: Message):
     await message.answer(
         "ℹ️ <b>Что я умею</b>\n\n"
+        "Бот открыт тем, кто есть в чате со списками водителей. "
+        "Выйдешь из чата — доступ пропадёт.\n\n"
         "🔍 <b>Найти пункт</b>\n"
         "Напиши номер ПП (<code>1125</code> или <code>ПП_1125</code>), "
         "номер из ссылки или саму ссылку <code>ozon.ru/point/...</code>, "
@@ -102,7 +181,8 @@ async def show_help(message: Message):
         "🚚 <b>Водитель</b>\n"
         "Утром в чат со списками присылают xlsx «Список курьерских выдач». "
         "Нажми «🚚 Водитель» и напиши номер ПП: покажу водителя, телефон "
-        "и остальные пункты его маршрута.\n\n"
+        "и остальные пункты его маршрута. "
+        "Если в чат со списками прислали замену, на этих ПП покажу того, кто едет вместо.\n\n"
         "❓ Если запутался или что-то не работает, напиши создателю: "
         "<a href=\"https://t.me/petyunyka\">@petyunyka</a>",
         reply_markup=main_menu_kb(),
@@ -206,6 +286,7 @@ CLOSING_EDIT_FIELDS = (
     ("closing_zasyl", "Засылы", "number"),
     ("closing_issued", "Выдано", "number"),
     ("closing_leftover", "Остатки", "number"),
+    ("closing_ozon_shelf", "Озон полка", "number"),
 )
 CLOSING_EDIT_BY_KEY = {key: (label, kind) for key, label, kind in CLOSING_EDIT_FIELDS}
 
@@ -213,6 +294,8 @@ CLOSING_EDIT_BY_KEY = {key: (label, kind) for key, label, kind in CLOSING_EDIT_F
 def closing_edit_rows(data: dict) -> list[tuple[str, str]]:
     rows = []
     for key, label, _kind in CLOSING_EDIT_FIELDS:
+        if key == "closing_ozon_shelf" and data.get(key) is None:
+            continue
         value = data.get(key)
         shown = "—" if value is None or value == "" else value
         rows.append((f"edit_field:{key}", f"{label}: {shown}"))
@@ -530,9 +613,10 @@ def build_report(data: dict) -> str:
             f"Выдано: {data['closing_issued']} ед.",
             "",
             f"Остатки на складе: {data['closing_leftover']} ед.",
-            "",
-            "ПП - закрыто.",
         ]
+        if data.get("closing_ozon_shelf") is not None:
+            lines.append(f"Остатки на Озон полке: {data['closing_ozon_shelf']} ед.")
+        lines.extend(["", "ПП - закрыто."])
         return "\n".join(lines)
     return "\n".join(lines)
 
@@ -1069,6 +1153,8 @@ def format_driver_answer(point_number: str, load: dict, people: list[dict]) -> s
     for person in people:
         lines.append("")
         lines.append(escape(person["name"]))
+        if person.get("replaced_from"):
+            lines.append(f"вместо {escape(person['replaced_from'])}")
         phone = (person.get("phone") or "").strip()
         lines.append(f"📞 {escape(phone)}" if phone else "📞 Телефон в файле не указан")
         others = [point for point in person["points"] if point != point_number]
@@ -1182,6 +1268,45 @@ async def _flush_courier_group(group_id: str, bot: Bot) -> None:
         messages = _courier_groups.pop(group_id, [])
     if messages:
         await _store_courier_files(messages, bot)
+
+
+def format_replacement_reply(result: dict) -> str:
+    remembered = result.get("stored") or []
+    if result.get("pending"):
+        lines = [
+            f"Списка на сегодня ещё нет. Запомнил замен: {len(remembered)}. Применю, когда придёт файл.",
+        ]
+    else:
+        lines = ["Учёл замены водителей."]
+    shown = result["applied"] if result.get("applied") else remembered
+    for item in shown:
+        points = item.get("points")
+        where = "все пункты этого водителя" if not points else "ПП " + ", ".join(points)
+        phone = item.get("new_phone") or ""
+        phone_part = f", {escape(phone)}" if phone else ""
+        lines.append(
+            f"• {escape(item['new_name'])}{phone_part} вместо {escape(item['old_name'])}: {escape(where)}"
+        )
+    for item in result.get("missing") or []:
+        lines.append(f"• Не нашёл в списке: {escape(item['old_name'])}")
+    return "\n".join(lines)
+
+
+@intake_router.message(F.text, F.chat.id.in_(COURIER_CHAT_IDS))
+@intake_router.message(F.caption, F.chat.id.in_(COURIER_CHAT_IDS))
+async def take_courier_replacement(message: Message):
+    if message.document:
+        raise SkipHandler()
+    if message.from_user and message.from_user.is_bot:
+        return
+    text = message.text or message.caption or ""
+    if "замен" not in text.casefold():
+        return
+    parsed = couriers.parse_replacements(text)
+    if not parsed:
+        return
+    result = await db.apply_courier_replacements(parsed)
+    await message.reply(format_replacement_reply(result))
 
 
 @intake_router.message(F.document, F.chat.id.in_(COURIER_CHAT_IDS))
