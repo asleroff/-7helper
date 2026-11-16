@@ -8,8 +8,11 @@ from datetime import datetime
 from html import escape
 from urllib.parse import quote
 import asyncio
+import json
+import os
 import re
 import time
+import urllib.request
 
 from io import BytesIO
 
@@ -275,18 +278,12 @@ async def process_report_type(callback: CallbackQuery, state: FSMContext):
     await ask_step("method", state, callback=callback)
 
 CLOSING_EDIT_FIELDS = (
-    ("closing_transport_number", "Номер перевозки", "text"),
-    ("closing_transport_date", "Дата", "text"),
-    ("closing_time", "Время", "text"),
     ("closing_accepted_total", "Принято", "number"),
-    ("closing_tya", "ТЯ", "number"),
-    ("closing_ktya", "КТЯ", "number"),
-    ("closing_shortage", "Недостачи", "number"),
-    ("closing_excess", "Излишки", "number"),
-    ("closing_zasyl", "Засылы", "number"),
+    ("closing_not_accepted", "Не принято", "number"),
     ("closing_issued", "Выдано", "number"),
-    ("closing_leftover", "Остатки", "number"),
-    ("closing_ozon_shelf", "Озон полка", "number"),
+    ("closing_leftover", "Остаток", "number"),
+    ("closing_ozon_shelf", "Остаток полка", "number"),
+    ("closing_time", "Машина", "text"),
 )
 CLOSING_EDIT_BY_KEY = {key: (label, kind) for key, label, kind in CLOSING_EDIT_FIELDS}
 
@@ -341,7 +338,7 @@ async def on_step_back(callback: CallbackQuery, state: FSMContext):
         elif data.get("fill_method") == "steps" and data.get("report_type") == "machine":
             target = "machine_time"
         elif data.get("fill_method") == "steps":
-            target = "leftover"
+            target = "shelf"
         else:
             target = "one"
     try:
@@ -367,7 +364,7 @@ async def start_steps(callback: CallbackQuery, state: FSMContext):
         await ask_step("machine_time", state, callback=callback)
     elif report_type == "closing":
         await state.update_data(fill_method="steps")
-        await ask_step("closing_number", state, callback=callback)
+        await ask_step("closing_time", state, callback=callback)
     else:
         await callback.answer("👆 Сначала выбери тип отчёта.", show_alert=True)
 
@@ -500,17 +497,23 @@ def step_view(target: str, data: dict) -> tuple:
         "closing_number": (ReportStates.closing_transport_number, "📦 Номер перевозки, например 6522092", step_kb("method")),
         "closing_time": (
             ReportStates.closing_time,
-            f"🕗 Во сколько закрыли перевозку?\n📅 В отчёте будет дата {closing_date}.",
-            step_kb("closing_number", now="closing_now"),
+            "🕗 Во сколько была машина? Например 12:55",
+            step_kb("method", now="closing_now"),
         ),
-        "accepted": (ReportStates.closing_accepted_total, "📥 Принято всего. Напиши число:", step_kb("closing_time")),
+        "accepted": (ReportStates.closing_accepted_total, "📥 Принято. Напиши число:", step_kb("closing_time")),
+        "not_accepted": (ReportStates.closing_not_accepted, "📭 Не принято. Напиши число:", step_kb("accepted")),
         "tya": (ReportStates.closing_tya, "📦 ТЯ (тарный ящик). Напиши число:", step_kb("accepted")),
         "ktya": (ReportStates.closing_ktya, "🗃️ КТЯ (картонный тарный ящик). Напиши число:", step_kb("tya")),
         "shortage": (ReportStates.closing_shortage, "⚠️ Недостачи. Напиши число:", step_kb("ktya")),
         "excess": (ReportStates.closing_excess, "➕ Излишки. Напиши число:", step_kb("shortage")),
         "zasyl": (ReportStates.closing_zasyl, "↪️ Засылы. Напиши число:", step_kb("excess")),
-        "issued": (ReportStates.closing_issued, "📤 Выдано. Напиши число:", step_kb("zasyl")),
-        "leftover": (ReportStates.closing_leftover, "🏬 Остатки на складе. Напиши число:", step_kb("issued")),
+        "issued": (ReportStates.closing_issued, "📤 Выдано. Напиши число:", step_kb("not_accepted")),
+        "leftover": (ReportStates.closing_leftover, "🏬 Остаток на складе. Напиши число:", step_kb("issued")),
+        "shelf": (
+            ReportStates.closing_ozon_shelf,
+            "📦 Остаток на Озон полке. Если полки нет, нажми «Нет полки».",
+            step_kb("leftover", now="shelf_skip", now_label="Нет полки"),
+        ),
         "place_pp": (AdminStates.waiting_place_pp, "🏷 Номер ПП, например 1125 или ПП_1125:", step_kb()),
         "place_ozon": (
             AdminStates.waiting_place_ozon,
@@ -594,29 +597,19 @@ def build_report(data: dict) -> str:
             f"Время: {data['machine_time']}",
         ]
     else:
-        shipment = str(data["closing_transport_number"]).lstrip("#").strip()
         lines = [
-            f"ПП-{data.get('point_number', '')}",
+            f"ПП_{data.get('point_number', '')}",
             "",
-            f"Закрыли перевозку #{shipment} от {data['closing_transport_date']}.",
-            "",
-            f"Закрыли перевозку в {data['closing_time']}",
-            "",
-            f"Принято всего: {data['closing_accepted_total']} ед.",
-            "",
-            f"1) ТЯ: {data['closing_tya']}",
-            f"2) КТЯ: {data['closing_ktya']}",
-            f"3) Недостачи: {data['closing_shortage']}",
-            f"4) Излишки: {data['closing_excess']}",
-            f"5) Засылы: {data['closing_zasyl']}",
-            "",
-            f"Выдано: {data['closing_issued']} ед.",
-            "",
-            f"Остатки на складе: {data['closing_leftover']} ед.",
+            "Перевозку закрыли",
+            f"Принято: {data.get('closing_accepted_total')}",
+            f"Не принято: {data.get('closing_not_accepted')}",
+            f"Выдано: {data.get('closing_issued')}",
+            f"Остаток: {data.get('closing_leftover')}",
         ]
         if data.get("closing_ozon_shelf") is not None:
-            lines.append(f"Остатки на Озон полке: {data['closing_ozon_shelf']} ед.")
-        lines.extend(["", "ПП - закрыто."])
+            lines.append(f"Остаток полка: {data.get('closing_ozon_shelf')}")
+        lines.append(f"Машина была в {data.get('closing_time')}")
+        lines.append("ПП закрыто")
         return "\n".join(lines)
     return "\n".join(lines)
 
@@ -690,7 +683,7 @@ async def process_closing_accepted_total(message: Message, state: FSMContext):
     if value is None:
         return
     await state.update_data(closing_accepted_total=value)
-    await ask_step("tya", state, message=message)
+    await ask_step("not_accepted", state, message=message)
 
 @router.message(ReportStates.closing_tya)
 async def process_closing_tya(message: Message, state: FSMContext):
@@ -740,11 +733,20 @@ async def process_closing_issued(message: Message, state: FSMContext):
     await state.update_data(closing_issued=value)
     await ask_step("leftover", state, message=message)
 
+
+@router.message(ReportStates.closing_not_accepted)
+async def process_closing_not_accepted(message: Message, state: FSMContext):
+    value = await take_number(message)
+    if value is None:
+        return
+    await state.update_data(closing_not_accepted=value)
+    await ask_step("issued", state, message=message)
+
 @router.callback_query(ReportStates.closing_time, F.data == "closing_now")
 async def closing_now(callback: CallbackQuery, state: FSMContext):
     now = datetime.now().strftime("%H:%M")
     await state.update_data(closing_time=now)
-    await callback.message.edit_text(f"🕗 Закрыли перевозку в {now}")
+    await callback.message.edit_text(f"🕗 Машина была в {now}")
     await ask_step("accepted", state, callback=callback, edit=False)
 
 @router.message(ReportStates.closing_time)
@@ -761,6 +763,15 @@ async def process_closing_leftover(message: Message, state: FSMContext):
     if value is None:
         return
     await state.update_data(closing_leftover=value)
+    await ask_step("shelf", state, message=message)
+
+
+@router.message(ReportStates.closing_ozon_shelf)
+async def process_closing_ozon_shelf(message: Message, state: FSMContext):
+    value = await take_number(message)
+    if value is None:
+        return
+    await state.update_data(closing_ozon_shelf=value)
     data = await state.get_data()
     await show_preview(
         message,
@@ -771,6 +782,21 @@ async def process_closing_leftover(message: Message, state: FSMContext):
         data.get("closing_leftover"),
     )
 
+
+@router.callback_query(ReportStates.closing_ozon_shelf, F.data == "shelf_skip")
+async def skip_ozon_shelf(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(closing_ozon_shelf=None)
+    data = await state.get_data()
+    await show_preview(
+        callback.message,
+        state,
+        build_report(data),
+        data.get("closing_accepted_total"),
+        data.get("closing_issued"),
+        data.get("closing_leftover"),
+    )
+    await callback.answer()
+
 @router.message(ReportStates.waiting_one_message)
 async def process_one_message(message: Message, state: FSMContext):
     report_text = await take_text(message)
@@ -780,9 +806,9 @@ async def process_one_message(message: Message, state: FSMContext):
 
     accepted = issued = leftover = None
     if data.get("report_type") == "closing":
-        acc = re.search(r"Принято всего\s*:?\s*(\d+)", report_text, re.I)
+        acc = re.search(r"(?<!Не )Принято\s*:?\s*(\d+)", report_text, re.I)
         iss = re.search(r"Выдано\s*:?\s*(\d+)", report_text, re.I)
-        left = re.search(r"Остатк\w*(?:\s+на складе)?\s*:?\s*(\d+)", report_text, re.I)
+        left = re.search(r"Остаток(?!\s+полка)\s*:?\s*(\d+)", report_text, re.I)
         if acc:
             accepted = int(acc.group(1))
         if iss:
@@ -1290,6 +1316,43 @@ def format_replacement_reply(result: dict) -> str:
     for item in result.get("missing") or []:
         lines.append(f"• Не нашёл в списке: {escape(item['old_name'])}")
     return "\n".join(lines)
+
+
+def _post_machine_seen(point_number: str, when: str) -> None:
+    base = os.getenv("TURBO_DRAFT_API_URL", "http://127.0.0.1:8787").rstrip("/")
+    token = os.getenv("TURBO_DRAFT_API_TOKEN", "dev-extension-token-change-me")
+    req = urllib.request.Request(
+        f"{base}/api/machine-seen",
+        data=json.dumps({"point_number": point_number, "time": when}).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=5):
+        return
+
+
+@intake_router.message(F.text, F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
+async def remember_machine_from_chat(message: Message):
+    if message.chat.id in COURIER_CHAT_IDS or (message.from_user and message.from_user.is_bot):
+        raise SkipHandler()
+    text = (message.text or "").strip()
+    if len(text) > 160 or not re.search(r"машин", text, re.I):
+        raise SkipHandler()
+    point = await db.point_by_chat(message.chat.id)
+    if not point:
+        return
+    clock = re.search(r"(?<!\d)([01]?\d|2[0-3])[:.]([0-5]\d)(?!\d)", text)
+    if clock:
+        when = f"{int(clock.group(1)):02d}:{clock.group(2)}"
+    else:
+        when = message.date.astimezone().strftime("%H:%M")
+    try:
+        await asyncio.to_thread(_post_machine_seen, str(point["point_number"]), when)
+    except Exception:
+        return
 
 
 @intake_router.message(F.text, F.chat.id.in_(COURIER_CHAT_IDS))

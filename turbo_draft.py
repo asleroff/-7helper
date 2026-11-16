@@ -80,6 +80,7 @@ def closing_fields_from_draft(payload: dict[str, Any]) -> dict[str, Any]:
         "closing_transport_date": c.get("transport_date"),
         "closing_time": c.get("closing_time"),
         "closing_accepted_total": num("accepted_total"),
+        "closing_not_accepted": num("not_accepted"),
         "closing_tya": num("tya"),
         "closing_ktya": num("ktya"),
         "closing_shortage": num("shortage"),
@@ -96,16 +97,10 @@ def closing_fields_from_draft(payload: dict[str, Any]) -> dict[str, Any]:
 def missing_closing_fields(fields: dict[str, Any]) -> list[str]:
     """Обязательные поля закрытия из черновика Турбо."""
     required = [
-        ("closing_transport_number", "номер перевозки"),
-        ("closing_transport_date", "дата перевозки"),
-        ("closing_time", "время закрытия"),
+        ("closing_time", "время машины"),
         ("closing_accepted_total", "принято"),
-        ("closing_tya", "ТЯ"),
-        ("closing_ktya", "КТЯ"),
-        ("closing_shortage", "недостачи"),
-        ("closing_excess", "излишки"),
-        ("closing_zasyl", "засылы"),
+        ("closing_not_accepted", "не принято"),
         ("closing_issued", "выдано"),
-        ("closing_leftover", "остатки"),
+        ("closing_leftover", "остаток"),
     ]
     return [label for key, label in required if fields.get(key) is None]

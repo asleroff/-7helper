@@ -71,10 +71,10 @@ def cancel_kb():
     builder.button(text="❌ Отмена", callback_data="cancel")
     return builder.as_markup()
 
-def step_kb(back_to: str | None = None, now: str | None = None):
+def step_kb(back_to: str | None = None, now: str | None = None, now_label: str = "🕐 Сейчас"):
     builder = InlineKeyboardBuilder()
     if now:
-        builder.button(text="🕐 Сейчас", callback_data=now)
+        builder.button(text=now_label, callback_data=now)
     if back_to:
         builder.button(text="◀️ Назад", callback_data=f"step_back:{back_to}")
     builder.button(text="❌ Отмена", callback_data="cancel")

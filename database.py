@@ -142,6 +142,16 @@ async def add_point(point_number: str, chat_id: int, title: str = None, address:
         )
         await db.commit()
 
+async def point_by_chat(chat_id: int) -> Optional[Dict[str, Any]]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT point_number, chat_id FROM points WHERE chat_id = ? LIMIT 1",
+            (int(chat_id),),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
 async def get_point(point_number: str) -> Optional[Dict[str, Any]]:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row

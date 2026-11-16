@@ -19,6 +19,8 @@ class ReportStates(StatesGroup):
     closing_zasyl = State()
     closing_issued = State()
     closing_leftover = State()
+    closing_not_accepted = State()
+    closing_ozon_shelf = State()
     waiting_one_message = State()
     choosing_edit_field = State()
     editing_field_value = State()
